@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from github import Github
-import os, uuid, base64, requests, datetime, time
+import os, uuid, base64, requests, datetime, time, json
 from dotenv import load_dotenv
 
 # -------------------------------
@@ -17,9 +17,9 @@ if not SECRET or not GITHUB_TOKEN or not GITHUB_USERNAME:
     raise Exception("Set SECRET, GITHUB_TOKEN, and GITHUB_USERNAME in .env")
 
 # -------------------------------
-# FASTAPI APP
+# FASTAPI APP INIT
 # -------------------------------
-app = FastAPI(title="Project 1 API")
+app = FastAPI(title="Project1 API")
 
 # -------------------------------
 # REQUEST MODEL
@@ -35,55 +35,67 @@ class TaskRequest(BaseModel):
     evaluation_url: str
     attachments: list = []
 
+class EvaluateRequest(BaseModel):
+    email: str
+    task: str
+    round: int
+    nonce: str
+    repo_url: str
+    commit_sha: str
+    pages_url: str
+
 # -------------------------------
-# HELPERS
+# HELPER FUNCTIONS
 # -------------------------------
 def verify_secret(secret: str):
     if secret != SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-def create_or_get_repo(task_name: str):
-    """Create a new public GitHub repo or reuse if exists."""
+def get_github_repo(task_name: str, email: str):
+    """Return existing repo if exists, else None"""
     g = Github(GITHUB_TOKEN)
     user = g.get_user()
-    repo_name = f"{task_name.lower()}-{uuid.uuid4().hex[:6]}"
+    repos = list(user.get_repos())
+    prefix = f"{task_name.lower()}-{email.replace('@','-').replace('.','-')}"
+    for repo in repos:
+        if repo.name.startswith(prefix):
+            return repo
+    return None
+
+def create_github_repo(task_name: str, email: str):
+    g = Github(GITHUB_TOKEN)
+    user = g.get_user()
+    repo_name = f"{task_name.lower()}-{email.replace('@','-').replace('.','-')}-{uuid.uuid4().hex[:5]}"
     repo = user.create_repo(
         name=repo_name,
         private=False,
-        description=f"Auto-generated repo for task: {task_name}",
+        description=f"Auto-generated repo for task {task_name}",
         auto_init=False
     )
     return repo
 
-def push_files_to_repo(repo, files: dict):
-    """Push files to GitHub repo; create or update."""
-    for path, content in files.items():
-        try:
-            # Check if file exists
-            try:
-                existing_file = repo.get_contents(path)
-                repo.update_file(path, f"Update {path}", content, existing_file.sha)
-            except:
-                repo.create_file(path, f"Add {path}", content)
-        except Exception as e:
-            print(f"Error pushing {path}: {e}")
-
-def enable_github_pages(repo):
-    """Enable GitHub Pages (gh-pages branch)"""
+def create_or_update_file(repo, path, content):
+    """Create a new file or update existing file using SHA"""
     try:
-        repo.edit(has_pages=True)
-        return f"https://{GITHUB_USERNAME}.github.io/{repo.name}/"
+        existing_file = None
+        try:
+            existing_file = repo.get_contents(path)
+        except:
+            existing_file = None
+        if existing_file:
+            repo.update_file(path, f"Update {path}", content, existing_file.sha)
+        else:
+            repo.create_file(path, f"Add {path}", content)
     except Exception as e:
-        print("Error enabling GitHub Pages:", e)
-        return None
+        print(f"Error creating/updating {path}: {e}")
 
 def generate_app_files(brief: str, attachments: list):
-    """Minimal HTML + README + LICENSE, include attachments."""
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>{brief}</title>
     </head>
     <body>
@@ -97,7 +109,6 @@ def generate_app_files(brief: str, attachments: list):
         "README.md": f"# Auto-generated App\n\n**Brief:** {brief}\n\nLicense: MIT",
         "LICENSE": "MIT License"
     }
-
     for att in attachments:
         try:
             data = att.get("url")
@@ -107,11 +118,17 @@ def generate_app_files(brief: str, attachments: list):
                 files[att["name"]] = content
         except Exception as e:
             print(f"Error decoding attachment {att.get('name')}: {e}")
-
     return files
 
+def enable_github_pages(repo):
+    try:
+        repo.edit(has_pages=True)
+        return f"https://{GITHUB_USERNAME}.github.io/{repo.name}/"
+    except Exception as e:
+        print("Error enabling GitHub Pages:", e)
+        return None
+
 def post_evaluation(payload: dict, evaluation_url: str):
-    """Post the evaluation payload with exponential backoff."""
     delay = 1
     for _ in range(5):
         try:
@@ -119,44 +136,43 @@ def post_evaluation(payload: dict, evaluation_url: str):
             if r.status_code == 200:
                 return True
             else:
-                print(f"Eval POST failed: {r.status_code} -> {r.text}")
+                print(f"Evaluation POST failed: {r.status_code} -> {r.text}")
         except Exception as e:
-            print(f"Eval POST error: {e}")
+            print(f"Evaluation POST error: {e}")
         time.sleep(delay)
         delay *= 2
-    raise HTTPException(status_code=500, detail="Evaluation POST failed after retries")
+    print("Evaluation POST failed after retries")
 
 # -------------------------------
-# /task ENDPOINT
+# ENDPOINTS
 # -------------------------------
 @app.post("/task")
 async def handle_task(request: TaskRequest):
     verify_secret(request.secret)
-
-    # Log task request
+    # Log task
     with open("task_log.jsonl", "a") as f:
         f.write(f"{datetime.datetime.now().isoformat()} {request.model_dump_json()}\n")
 
+    # Get or create repo
+    repo = get_github_repo(request.task, request.email)
+    if not repo:
+        repo = create_github_repo(request.task, request.email)
+
     # Generate files
-    files_to_push = generate_app_files(request.brief, request.attachments)
-
-    # Create GitHub repo
-    repo = create_or_get_repo(request.task)
-
-    # Push files
-    push_files_to_repo(repo, files_to_push)
+    files = generate_app_files(request.brief, request.attachments)
+    for path, content in files.items():
+        create_or_update_file(repo, path, content)
 
     # Enable Pages
     pages_url = enable_github_pages(repo)
 
     # Get latest commit SHA
-    commit_sha = None
     try:
         commit_sha = repo.get_commits()[0].sha
-    except Exception as e:
-        print("Error fetching commit SHA:", e)
+    except:
+        commit_sha = None
 
-    # Build payload for evaluator
+    # Post evaluation
     evaluation_payload = {
         "email": request.email,
         "task": request.task,
@@ -166,32 +182,13 @@ async def handle_task(request: TaskRequest):
         "commit_sha": commit_sha,
         "pages_url": pages_url
     }
+    post_evaluation(evaluation_payload, request.evaluation_url)
 
-    # Post to evaluation URL
-    try:
-        post_evaluation(evaluation_payload, request.evaluation_url)
-    except Exception as e:
-        print(f"Warning: could not post to evaluation URL: {e}")
+    return {"status": "ok", "message": "Task received successfully", "repo_url": repo.html_url, "pages_url": pages_url}
 
-    return {
-        "status": "ok",
-        "message": "Task received successfully",
-        "repo_url": repo.html_url,
-        "pages_url": pages_url
-    }
-
-# -------------------------------
-# /evaluate ENDPOINT
-# -------------------------------
 @app.post("/evaluate")
-async def evaluate(request: Request):
-    try:
-        payload = await request.json()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-
-    # Log evaluation payload
+async def evaluate(request: EvaluateRequest):
+    # Log evaluation
     with open("evaluation_log.jsonl", "a") as f:
-        f.write(f"{datetime.datetime.now().isoformat()} {payload}\n")
-
-    return {"status": "ok", "message": "Evaluation received successfully"}
+        f.write(f"{datetime.datetime.now().isoformat()} {request.model_dump_json()}\n")
+    return {"status": "ok", "message": "Evaluation recorded successfully"}
