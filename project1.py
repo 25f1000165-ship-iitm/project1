@@ -1,5 +1,5 @@
 # project1.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from github import Github
 import os, uuid, base64, requests, datetime, time
@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 # LOAD ENVIRONMENT VARIABLES
 # -------------------------------
 load_dotenv()
-
 SECRET = os.getenv("SECRET")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
@@ -18,12 +17,12 @@ if not SECRET or not GITHUB_TOKEN or not GITHUB_USERNAME:
     raise Exception("Set SECRET, GITHUB_TOKEN, and GITHUB_USERNAME in .env")
 
 # -------------------------------
-# FASTAPI APP INIT
+# FASTAPI APP
 # -------------------------------
 app = FastAPI(title="Project 1 API")
 
 # -------------------------------
-# REQUEST MODELS
+# REQUEST MODEL
 # -------------------------------
 class TaskRequest(BaseModel):
     email: str
@@ -36,25 +35,15 @@ class TaskRequest(BaseModel):
     evaluation_url: str
     attachments: list = []
 
-class EvaluateRequest(BaseModel):
-    email: str
-    task: str
-    round: int
-    nonce: str
-    repo_url: str
-    commit_sha: str
-    pages_url: str
-
 # -------------------------------
 # HELPERS
 # -------------------------------
 def verify_secret(secret: str):
-    """Verify that the incoming secret matches the server secret."""
     if secret != SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-def create_github_repo(task_name: str):
-    """Create a new public GitHub repository using the provided token."""
+def create_or_get_repo(task_name: str):
+    """Create a new public GitHub repo or reuse if exists."""
     g = Github(GITHUB_TOKEN)
     user = g.get_user()
     repo_name = f"{task_name.lower()}-{uuid.uuid4().hex[:6]}"
@@ -67,7 +56,7 @@ def create_github_repo(task_name: str):
     return repo
 
 def push_files_to_repo(repo, files: dict):
-    """Push or update files to the GitHub repository."""
+    """Push files to GitHub repo; create or update."""
     for path, content in files.items():
         try:
             # Check if file exists
@@ -75,33 +64,26 @@ def push_files_to_repo(repo, files: dict):
                 existing_file = repo.get_contents(path)
                 repo.update_file(path, f"Update {path}", content, existing_file.sha)
             except:
-                # File doesn't exist, create new
                 repo.create_file(path, f"Add {path}", content)
         except Exception as e:
             print(f"Error pushing {path}: {e}")
 
 def enable_github_pages(repo):
-    """Enable GitHub Pages and return the public URL."""
+    """Enable GitHub Pages (gh-pages branch)"""
     try:
-        ref_list = [r.ref for r in repo.get_git_refs()]
-        main_branch = "main" if "refs/heads/main" in ref_list else "master"
-        if "refs/heads/gh-pages" not in ref_list:
-            master_ref = repo.get_git_ref(f"heads/{main_branch}")
-            repo.create_git_ref(ref="refs/heads/gh-pages", sha=master_ref.object.sha)
-        repo.edit(default_branch="gh-pages")
+        repo.edit(has_pages=True)
         return f"https://{GITHUB_USERNAME}.github.io/{repo.name}/"
     except Exception as e:
         print("Error enabling GitHub Pages:", e)
         return None
 
 def generate_app_files(brief: str, attachments: list):
-    """Generate minimal HTML + README + LICENSE files, plus attachments."""
+    """Minimal HTML + README + LICENSE, include attachments."""
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta charset="UTF-8">
         <title>{brief}</title>
     </head>
     <body>
@@ -129,7 +111,7 @@ def generate_app_files(brief: str, attachments: list):
     return files
 
 def post_evaluation(payload: dict, evaluation_url: str):
-    """Post the evaluation payload with exponential backoff retries."""
+    """Post the evaluation payload with exponential backoff."""
     delay = 1
     for _ in range(5):
         try:
@@ -137,30 +119,29 @@ def post_evaluation(payload: dict, evaluation_url: str):
             if r.status_code == 200:
                 return True
             else:
-                print(f"Evaluation POST failed: {r.status_code} -> {r.text}")
+                print(f"Eval POST failed: {r.status_code} -> {r.text}")
         except Exception as e:
-            print(f"Evaluation POST error: {e}")
+            print(f"Eval POST error: {e}")
         time.sleep(delay)
         delay *= 2
     raise HTTPException(status_code=500, detail="Evaluation POST failed after retries")
 
 # -------------------------------
-# TASK ENDPOINT
+# /task ENDPOINT
 # -------------------------------
 @app.post("/task")
 async def handle_task(request: TaskRequest):
-    """Main endpoint for receiving and processing task requests."""
     verify_secret(request.secret)
 
     # Log task request
     with open("task_log.jsonl", "a") as f:
         f.write(f"{datetime.datetime.now().isoformat()} {request.model_dump_json()}\n")
 
-    # Generate app files
+    # Generate files
     files_to_push = generate_app_files(request.brief, request.attachments)
 
     # Create GitHub repo
-    repo = create_github_repo(request.task)
+    repo = create_or_get_repo(request.task)
 
     # Push files
     push_files_to_repo(repo, files_to_push)
@@ -168,14 +149,14 @@ async def handle_task(request: TaskRequest):
     # Enable Pages
     pages_url = enable_github_pages(repo)
 
-    # Get commit SHA
+    # Get latest commit SHA
     commit_sha = None
     try:
         commit_sha = repo.get_commits()[0].sha
     except Exception as e:
         print("Error fetching commit SHA:", e)
 
-    # Build evaluation payload
+    # Build payload for evaluator
     evaluation_payload = {
         "email": request.email,
         "task": request.task,
@@ -186,19 +167,31 @@ async def handle_task(request: TaskRequest):
         "pages_url": pages_url
     }
 
-    # Post to evaluator
-    post_evaluation(evaluation_payload, request.evaluation_url)
+    # Post to evaluation URL
+    try:
+        post_evaluation(evaluation_payload, request.evaluation_url)
+    except Exception as e:
+        print(f"Warning: could not post to evaluation URL: {e}")
 
-    return {"status": "ok", "message": "Task received and processed successfully",
-            "repo_url": repo.html_url, "pages_url": pages_url}
+    return {
+        "status": "ok",
+        "message": "Task received successfully",
+        "repo_url": repo.html_url,
+        "pages_url": pages_url
+    }
 
 # -------------------------------
-# EVALUATE ENDPOINT
+# /evaluate ENDPOINT
 # -------------------------------
 @app.post("/evaluate")
-async def handle_evaluate(req: EvaluateRequest):
-    """Accept evaluation callback from /task."""
-    # Log evaluation request
+async def evaluate(request: Request):
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    # Log evaluation payload
     with open("evaluation_log.jsonl", "a") as f:
-        f.write(f"{datetime.datetime.now().isoformat()} {req.model_dump_json()}\n")
-    return {"status": "ok", "message": "Evaluation accepted"}
+        f.write(f"{datetime.datetime.now().isoformat()} {payload}\n")
+
+    return {"status": "ok", "message": "Evaluation received successfully"}
